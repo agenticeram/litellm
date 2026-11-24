@@ -11,6 +11,8 @@
 //! | [`LaxBool`] | `core_helpers.lax_bool(value)` |
 //! | [`UintOrUnset`] | `get_env_int_or_none(name)`, unset for a negative value too |
 //! | [`FloatOrUnset`] | `get_env_float_or_none(name)` |
+//! | [`ParamNames`] | `core_helpers.allowed_openai_param_names(value)` |
+//! | [`TextEntries`] | `[entry for entry in value if isinstance(entry, str)]` when `value` is a list |
 //!
 //! The bool rules are `serde_with` adapters, used as `#[serde_as(as = "IsTrue")]` on a `bool`, and
 //! [`LaxBool`] on an `Option<bool>`.
@@ -226,4 +228,45 @@ impl<T> Lenient<Box<[T]>> {
     pub fn items(&self) -> &[T] {
         self.valid().map(|items| &**items).unwrap_or_default()
     }
+}
+
+/// `allowed_openai_param_names`: the `\w+` words of text, a mapping's text keys, or a list's
+/// text entries. `None` and any other value name nothing.
+pub struct ParamNames;
+
+impl<'de> DeserializeAs<'de, Box<[String]>> for ParamNames {
+    fn deserialize_as<D: Deserializer<'de>>(deserializer: D) -> Result<Box<[String]>, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Str(text) => text
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Value::Dict(entries) => text_items(entries.into_iter().map(|(key, _)| key)),
+            Value::List(items) => text_items(items),
+            _ => Box::default(),
+        })
+    }
+}
+
+/// A list's text entries, skipping the rest. Any value but a list holds none.
+pub struct TextEntries;
+
+impl<'de> DeserializeAs<'de, Box<[String]>> for TextEntries {
+    fn deserialize_as<D: Deserializer<'de>>(deserializer: D) -> Result<Box<[String]>, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::List(items) => text_items(items),
+            _ => Box::default(),
+        })
+    }
+}
+
+fn text_items(items: impl IntoIterator<Item = Value>) -> Box<[String]> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            Value::Str(text) => Some(text),
+            _ => None,
+        })
+        .collect()
 }

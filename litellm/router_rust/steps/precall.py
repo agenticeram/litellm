@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 # The chat params a deployment must take when the request sends them (`_PRE_CALL_CHECK_FILTERED_PARAMS`).
 _FILTERED_PARAMS: Final = frozenset({"response_format"})
+_CALL_SETTINGS: Final = ("drop_params", "allowed_openai_params", "additional_drop_params")
 _CHARS_PER_OFFLOADED_COUNT: Final = 1 << 16
 
 
@@ -255,25 +256,21 @@ def _supports_param(deployment: Mapping[str, object], group: str, param: str) ->
     return supported is None or param in supported
 
 
-def _lacks_params(deployment: Mapping[str, object], group: str, params: frozenset[str]) -> bool:
-    return any(not _supports_param(deployment, group, param) for param in params)
-
-
-def _rejects_params(
-    deployment: Mapping[str, object], group: str, params: frozenset[str], request_kwargs: Mapping[str, object]
-) -> bool:
-    """``_deployment_rejects_params``: lacks a param neither the deployment nor the request drops or allows."""
+def _rejectable_params(
+    deployment: Mapping[str, object], params: frozenset[str], request_kwargs: Mapping[str, object]
+) -> frozenset[str]:
+    """The ``params`` ``_deployment_rejects_params`` checks: those neither the deployment nor the request drops or allows."""
     call_settings: Final[Mapping[str, object]] = {
         **(as_str_mapping(deployment.get("litellm_params")) or {}),
         **request_kwargs,
     }
     if call_settings.get("drop_params") is True:
-        return False
+        return frozenset()
     dropped: Final = call_settings.get("additional_drop_params")
     dropped_names: Final = frozenset(
         entry for entry in (_items(dropped) if _is_list(dropped) else ()) if isinstance(entry, str)
     )
-    return _lacks_params(deployment, group, params - _declared_param_allowlist(call_settings) - dropped_names)
+    return params - _declared_param_allowlist(call_settings) - dropped_names
 
 
 def _requested_params(request_kwargs: Mapping[str, object]) -> frozenset[str]:
@@ -418,26 +415,24 @@ class PreCallFacts:
         if not self._has_input:
             return {"has_input": False}
         request: Final[Mapping[str, object]] = self._request if self._request is not None else {}
-        params: Final = (
-            _requested_params(request)
-            if self._request is not None and self._host.dynamic().drop_params is False
-            else frozenset[str]()
-        )
-        deployments: Final[dict[str, dict[str, object]]] = {}  # mutable-ok: built here, then returned
-        for id in dict.fromkeys([*self._candidates, *self._pool]):
-            record = self._record(id)
-            deployments[id] = {
+        sent: Final = _requested_params(request) if self._request is not None else frozenset[str]()
+        deployments: Final = {
+            id: {
                 "max_input_tokens": self._windows.get(id),
-                "lacks_params": bool(params) and id in self._candidates and _lacks_params(record, self._model, params),
-                "rejects_params": bool(params) and _rejects_params(record, self._model, params, request),
+                "unsupported_params": sorted(
+                    param for param in sent if not _supports_param(self._record(id), self._model, param)
+                ),
             }
-        allowed_region: Final = request.get("allowed_model_region")
+            for id in dict.fromkeys([*self._candidates, *self._pool])
+        }
         return {
             "has_input": True,
             "countable": not compaction_pending(self._request),
             "input_tokens": input_tokens,
-            "allowed_model_region": allowed_region,
-            "requested_params": sorted(params),
+            "allowed_model_region": request.get("allowed_model_region"),
+            "drop_params": self._host.dynamic().drop_params,
+            "sent_params": sorted(sent),
+            "call_settings": {key: request[key] for key in _CALL_SETTINGS if key in request},
             "deployments": deployments,
         }
 
@@ -495,16 +490,28 @@ def pre_call_checks(
         params: Final = as_str_mapping(records[id].get("litellm_params")) or {}
         return allowed_region is not None and params.get("region_name") != allowed_region
 
+    request: Final[Mapping[str, object]] = request_kwargs or {}
+    params: Final = (
+        frozenset(str(param) for param in _items(answer.get("sent_params")))
+        if host.dynamic().drop_params is False
+        else frozenset[str]()
+    )
+
+    def unsupported(id: str) -> frozenset[str]:
+        return frozenset(str(param) for param in _items(row(id).get("unsupported_params")))
+
+    def rejects(id: str) -> bool:
+        return bool(_rejectable_params(records[id], params, request) & unsupported(id))
+
     too_small: Final = tuple(id for id in candidates if over_window(id))
     invalid: Final = frozenset(too_small) | frozenset(id for id in candidates if out_of_region(id))
     param_candidates: Final = tuple(id for id in candidates if id not in invalid)
-    lacking: Final = tuple(row(id).get("lacks_params") is True for id in param_candidates)
-    rejecting: Final = tuple(row(id).get("rejects_params") is True for id in param_candidates)
-    failing: Final = rejecting if lacking and all(lacking) else lacking
+    lacking: Final = tuple(bool(params & unsupported(id)) for id in param_candidates)
+    failing: Final = tuple(map(rejects, param_candidates)) if lacking and all(lacking) else lacking
     excluded: Final = invalid | frozenset(id for id, fails in zip(param_candidates, failing, strict=True) if fails)
     if len(excluded) == len(candidates):
-        requested: Final = [str(param) for param in _items(answer.get("requested_params"))]
-        if not too_small and group and all(row(id).get("rejects_params") is True for id in group):
+        requested: Final = sorted(params)
+        if not too_small and group and all(map(rejects, group)):
             raise litellm_exceptions.UnsupportedParamsError(
                 message=(
                     f"no deployment of model={model} supports {requested}. "

@@ -1,9 +1,9 @@
 //! `enable_pre_call_checks` (`_pre_call_checks`): before a pick, drop the deployments whose
 //! context window the prompt exceeds, those outside the request's `allowed_model_region`, and
 //! those that cannot take a requested param, then decide which error a group with nothing left
-//! raises. Each stage is its own module. The facts that need live model data (the prompt's token
-//! count, each deployment's context window, which params it takes) come from
-//! [`RouterHost::pre_call_facts`]; every decision is made here.
+//! raises. Each stage is its own module. The facts that need live data (the prompt's token
+//! count, each deployment's context window, which params it does not support, the live
+//! `litellm.drop_params`) come from [`RouterHost::pre_call_facts`]; every decision is made here.
 //!
 //! [`RouterHost::pre_call_facts`]: crate::host::RouterHost::pre_call_facts
 
@@ -11,11 +11,18 @@ mod context_window;
 mod params;
 mod region;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use context_window::Overflow;
+use litellm_python_compat::lenient::LaxBool;
 use serde::Deserialize;
 use serde_json::Value;
+use serde_with::serde_as;
+
+pub use params::CallSettings;
 
 use crate::{error::Error, registry::Deployment};
 
@@ -26,13 +33,17 @@ pub struct DeploymentFacts {
     /// The deployment's context window (`get_router_model_info`'s `max_input_tokens`), when it
     /// declares one and resolves.
     pub max_input_tokens: Option<i64>,
-    /// `_deployment_lacks_params`: it does not support one of the requested params.
-    pub lacks_params: bool,
-    /// `_deployment_rejects_params`: it lacks one the request and deployment neither drop nor allow.
-    pub rejects_params: bool,
+    /// The sent params it does not support (`_deployment_supports_param`).
+    pub unsupported_params: BTreeSet<String>,
 }
 
+static NO_FACTS: DeploymentFacts = DeploymentFacts {
+    max_input_tokens: None,
+    unsupported_params: BTreeSet::new(),
+};
+
 /// What the host knows about a request for the pre-call checks.
+#[serde_as]
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PreCallFacts {
@@ -44,18 +55,21 @@ pub struct PreCallFacts {
     pub input_tokens: Option<i64>,
     /// The request's `allowed_model_region`.
     pub allowed_model_region: Option<Value>,
-    /// The requested params the check filters on, sorted (`_pre_call_check_requested_chat_params`).
-    pub requested_params: Vec<String>,
+    /// The live `litellm.drop_params`. Params are checked only while it is `false`.
+    #[serde_as(as = "LaxBool")]
+    pub drop_params: Option<bool>,
+    /// The filtered params the request sends as anything but text
+    /// (`_pre_call_check_requested_chat_params`).
+    pub sent_params: BTreeSet<String>,
+    /// The request's own call settings, which win over each deployment's.
+    pub call_settings: CallSettings,
     /// Facts by deployment id, for the candidates and the group's deployments.
     pub deployments: BTreeMap<String, DeploymentFacts>,
 }
 
 impl PreCallFacts {
-    fn of(&self, deployment: &Deployment) -> DeploymentFacts {
-        self.deployments
-            .get(&deployment.id)
-            .cloned()
-            .unwrap_or_default()
+    fn of(&self, deployment: &Deployment) -> &DeploymentFacts {
+        self.deployments.get(&deployment.id).unwrap_or(&NO_FACTS)
     }
 }
 
@@ -80,19 +94,23 @@ pub fn filter(
         .zip(&overflows)
         .map(|(deployment, overflow)| overflow.is_some() || region::outside(deployment, facts))
         .collect();
+    let requested = params::requested(facts);
     let left: Vec<&Deployment> = candidates
         .iter()
         .zip(&dropped)
         .filter(|(_, dropped)| !**dropped)
         .map(|(deployment, _)| &**deployment)
         .collect();
-    let mut failing = params::failing(&left, facts).into_iter();
+    let mut failing = params::failing(&left, requested, facts).into_iter();
     let kept: Vec<bool> = dropped
         .iter()
         .map(|dropped| !dropped && failing.next() == Some(false))
         .collect();
     if !kept.contains(&true) {
-        if !context_window_error && let Some(error) = params::unsupported(model, pool, facts) {
+        let pool: Vec<&Deployment> = pool.iter().map(|deployment| &**deployment).collect();
+        if !context_window_error
+            && let Some(error) = params::unsupported(model, &pool, requested, facts)
+        {
             return Err(error);
         }
         if context_window_error {
@@ -212,11 +230,30 @@ mod tests {
         assert_eq!(left.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), kept);
     }
 
+    fn lacking() -> DeploymentFacts {
+        DeploymentFacts {
+            unsupported_params: BTreeSet::from(["response_format".to_owned()]),
+            ..DeploymentFacts::default()
+        }
+    }
+
+    fn sending_response_format(entries: &[(&str, DeploymentFacts)]) -> PreCallFacts {
+        PreCallFacts {
+            drop_params: Some(false),
+            sent_params: BTreeSet::from(["response_format".to_owned()]),
+            ..facts(entries)
+        }
+    }
+
+    fn ids(kept: &[Arc<Deployment>]) -> Vec<&str> {
+        kept.iter().map(|d| d.id.as_str()).collect()
+    }
+
     #[rstest]
     fn params_are_checked_only_on_deployments_inside_the_region() {
         let eu = deployment(
             "eu",
-            json!({"model": "openai/old", "region_name": "eu"}),
+            json!({"model": "openai/old", "region_name": "eu", "drop_params": true}),
             json!({}),
         );
         let ap = deployment(
@@ -224,34 +261,16 @@ mod tests {
             json!({"model": "openai/new", "region_name": "ap"}),
             json!({}),
         );
-        let mut found = facts(&[(
-            "eu",
-            DeploymentFacts {
-                lacks_params: true,
-                ..DeploymentFacts::default()
-            },
-        )]);
-        found.requested_params = vec!["response_format".to_owned()];
+        let mut found = sending_response_format(&[("eu", lacking())]);
         found.allowed_model_region = Some(json!("eu"));
         let kept = filter("g", vec![eu, ap], &[], &found).unwrap();
-        assert_eq!(
-            kept.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            ["eu"]
-        );
+        assert_eq!(ids(&kept), ["eu"]);
     }
 
     #[rstest]
     fn a_group_where_every_deployment_rejects_the_param_is_unsupported() {
         let old = deployment("old", json!({"model": "openai/old"}), json!({}));
-        let mut found = facts(&[(
-            "old",
-            DeploymentFacts {
-                lacks_params: true,
-                rejects_params: true,
-                ..DeploymentFacts::default()
-            },
-        )]);
-        found.requested_params = vec!["response_format".to_owned()];
+        let found = sending_response_format(&[("old", lacking())]);
         let error = filter("g", vec![old.clone()], &[old], &found).unwrap_err();
         assert!(
             matches!(error, Error::UnsupportedParams { params, .. } if params == ["response_format"])
@@ -260,20 +279,46 @@ mod tests {
 
     #[rstest]
     fn a_deployment_that_takes_the_param_wins_over_one_that_would_drop_it() {
-        let old = deployment("old", json!({"model": "openai/old"}), json!({}));
-        let new = deployment("new", json!({"model": "openai/new"}), json!({}));
-        let mut found = facts(&[(
+        let old = deployment(
             "old",
-            DeploymentFacts {
-                lacks_params: true,
-                ..DeploymentFacts::default()
-            },
-        )]);
-        found.requested_params = vec!["response_format".to_owned()];
-        let kept = filter("g", vec![old, new], &[], &found).unwrap();
-        assert_eq!(
-            kept.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            ["new"]
+            json!({"model": "openai/old", "drop_params": true}),
+            json!({}),
         );
+        let new = deployment("new", json!({"model": "openai/new"}), json!({}));
+        let found = sending_response_format(&[("old", lacking())]);
+        let kept = filter("g", vec![old, new], &[], &found).unwrap();
+        assert_eq!(ids(&kept), ["new"]);
+    }
+
+    #[rstest]
+    #[case::rejected(json!({}), json!({}), Some(false), 0)]
+    #[case::own_drop_params(json!({"drop_params": "true"}), json!({}), Some(false), 1)]
+    #[case::own_allowlist(json!({"allowed_openai_params": ["response_format"]}), json!({}), Some(false), 1)]
+    #[case::own_drop_list(json!({"additional_drop_params": ["response_format"]}), json!({}), Some(false), 1)]
+    #[case::sent_allowlist_text(json!({}), json!({"allowed_openai_params": "tools,response_format"}), Some(false), 1)]
+    #[case::sent_drop_params_wins(json!({"drop_params": true}), json!({"drop_params": false}), Some(false), 0)]
+    #[case::sent_allowlist_wins(
+        json!({"allowed_openai_params": ["response_format"]}),
+        json!({"allowed_openai_params": ["tools"]}),
+        Some(false),
+        0
+    )]
+    #[case::global_drop_params(json!({}), json!({}), Some(true), 1)]
+    #[case::global_drop_params_unset(json!({}), json!({}), None, 1)]
+    fn when_every_deployment_lacks_the_param_only_those_rejecting_it_are_dropped(
+        #[case] own: Value,
+        #[case] sent: Value,
+        #[case] global_drop_params: Option<bool>,
+        #[case] kept: usize,
+    ) {
+        let mut params = own;
+        params["model"] = json!("openai/old");
+        let old = deployment("old", params, json!({}));
+        let found = PreCallFacts {
+            drop_params: global_drop_params,
+            call_settings: serde_json::from_value(sent).unwrap(),
+            ..sending_response_format(&[("old", lacking())])
+        };
+        assert_eq!(filter("g", vec![old], &[], &found).unwrap().len(), kept);
     }
 }

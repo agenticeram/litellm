@@ -1,4 +1,6 @@
-use litellm_python_compat::lenient::{IsTrue, LaxBool, LaxBoolOr, Lenient, StrBool, Truthy};
+use litellm_python_compat::lenient::{
+    IsTrue, LaxBool, LaxBoolOr, Lenient, ParamNames, StrBool, TextEntries, Truthy,
+};
 use rstest::rstest;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -155,4 +157,40 @@ fn lax_bool_matches_core_helpers() {
         })
         .collect();
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct Names(#[serde_as(as = "ParamNames")] Box<[String]>);
+
+/// Expected values from CPython: `allowed_openai_param_names(json.loads(value))`.
+#[rstest]
+#[case::text(json!("response_format, tools;x-y"), &["response_format", "tools", "x", "y"][..])]
+#[case::mapping(json!({"response_format": null, "tools": 1}), &["response_format", "tools"][..])]
+#[case::list(json!(["response_format", 5, null, "tools"]), &["response_format", "tools"][..])]
+#[case::null(json!(null), &[][..])]
+#[case::number(json!(5), &[][..])]
+fn param_names_read_text_mapping_keys_and_list_entries(
+    #[case] value: Value,
+    #[case] expected: &[&str],
+) {
+    assert_eq!(
+        &*serde_json::from_value::<Names>(value).unwrap().0,
+        expected
+    );
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct Entries(#[serde_as(as = "TextEntries")] Box<[String]>);
+
+#[rstest]
+#[case::list(json!(["tools", 5, "response_format"]), &["tools", "response_format"][..])]
+#[case::text(json!("tools"), &[][..])]
+#[case::mapping(json!({"tools": 1}), &[][..])]
+fn text_entries_are_a_lists_text_only(#[case] value: Value, #[case] expected: &[&str]) {
+    assert_eq!(
+        &*serde_json::from_value::<Entries>(value).unwrap().0,
+        expected
+    );
 }
