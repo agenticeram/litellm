@@ -18,7 +18,7 @@ import json
 import logging
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -643,7 +643,8 @@ class RedisCache(BaseCache):
         # redis namespaces
         self.namespace = namespace
         # for high traffic, we store the redis results in memory and then batch write to redis
-        self.redis_batch_writing_buffer: list[tuple[str, object]] = []
+        self.redis_batch_writing_buffer: Final = deque[tuple[str, object, int | None]]()
+        self._batch_write_lock = asyncio.Lock()
         if redis_flush_size is None:
             self.redis_flush_size: int = 100
         else:
@@ -1420,14 +1421,11 @@ class RedisCache(BaseCache):
             _record_swallowed_redis_failure(self._health, e)
 
     @_redis_circuit_breaker_guard
-    async def batch_cache_write(self, key: str, value: object, **kwargs: object):
-        print_verbose(
-            f"in batch cache writing for redis buffer size={len(self.redis_batch_writing_buffer)}",
-        )
-        key = self.check_and_fix_namespace(key=key)
-        self.redis_batch_writing_buffer.append((key, value))
-        if len(self.redis_batch_writing_buffer) >= self.redis_flush_size:
-            await self.flush_cache_buffer()  # logging done in here
+    async def batch_cache_write(self, key: str, value: object, scoped_ttl: int | None = None, **kwargs: object):
+        async with self._batch_write_lock:
+            self.redis_batch_writing_buffer.append((key, value, scoped_ttl))
+            if scoped_ttl is not None or len(self.redis_batch_writing_buffer) >= self.redis_flush_size:
+                await self.flush_cache_buffer()
 
     @staticmethod
     async def _incrbyfloat_with_ttl(
@@ -1594,8 +1592,13 @@ class RedisCache(BaseCache):
 
     async def flush_cache_buffer(self):
         print_verbose(f"flushing to redis....reached size of buffer {len(self.redis_batch_writing_buffer)}")
-        await self.async_set_cache_pipeline(self.redis_batch_writing_buffer)
-        self.redis_batch_writing_buffer = []
+        if any(ttl is not None for _, _, ttl in self.redis_batch_writing_buffer):
+            await self.async_set_cache_pipeline_with_ttls(tuple(self.redis_batch_writing_buffer))
+        else:
+            await self.async_set_cache_pipeline(
+                tuple((key, value) for key, value, _ in self.redis_batch_writing_buffer)
+            )
+        self.redis_batch_writing_buffer.clear()
 
     def _get_cache_logic(self, cached_response: bytes | str | None):
         """
